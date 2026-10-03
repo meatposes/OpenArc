@@ -39,6 +39,12 @@ dependencies = [
     "zensical>=0.0.31",
 ]
 
+[project.optional-dependencies]
+# speaker diarization (model_type: diarization); pulls lightning, matplotlib, optuna
+diarization = [
+    "pyannote.audio>=4.0.7",
+]
+
 [dependency-groups]
 test = [
     "pytest>=8.4.2",

@@ -19,6 +19,7 @@ from src.server.schemas.modeling.contract_kokoro import (
 from src.server.schemas.modeling.contract_optimum_emb import PreTrainedTokenizerConfig
 from src.server.schemas.modeling.contract_optimum_rerank import RerankerConfig
 from src.server.schemas.modeling.contract_qwen3asr import OV_Qwen3ASRGenConfig
+from src.server.schemas.modeling.contract_diarization import OV_DiarizationGenConfig
 from src.server.schemas.modeling.contract_ovgenai_llm_and_vlm import OVGenAI_GenConfig
 from src.server.schemas.modeling.contract_qwen3tts import (
     OV_Qwen3TTSCustomVoice,
@@ -635,6 +636,50 @@ async def openai_audio_transcriptions(
     except Exception as exc:
         logger.error(f"Transcription failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(exc)}")
+
+
+@router.post("/audio/diarization", dependencies=[Depends(verify_api_key)])
+async def openarc_audio_diarization(
+    file: UploadFile = File(..., description="The audio file to diarize"),
+    model: str = Form(..., description="ID of a loaded diarization model"),
+    num_speakers: Optional[int] = Form(None, description="Exact number of speakers, when known"),
+    min_speakers: Optional[int] = Form(None, description="Lower bound on the number of speakers"),
+    max_speakers: Optional[int] = Form(None, description="Upper bound on the number of speakers"),
+):
+    """Who spoke when. Returns non-overlapping speaker turns and one embedding per speaker
+    (compare with /v1/audio/voiceprint output by cosine similarity to put names on speakers)."""
+    try:
+        logger.info(f'"{model}" diarization request received')
+        gen_config = OV_DiarizationGenConfig(
+            audio_base64=base64.b64encode(await file.read()).decode("utf-8"),
+            num_speakers=num_speakers, min_speakers=min_speakers, max_speakers=max_speakers,
+        )
+        result = await _workers.diarize(model, gen_config)
+        logger.info(f"[audio/diarization] model={model} metrics={result.get('metrics')}")
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Diarization failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Diarization failed: {str(exc)}")
+
+
+@router.post("/audio/voiceprint", dependencies=[Depends(verify_api_key)])
+async def openarc_audio_voiceprint(
+    file: UploadFile = File(..., description="Speech from one person only, ideally 30-60 s"),
+    model: str = Form(..., description="ID of a loaded diarization model"),
+):
+    """One speaker embedding, in the same space as /v1/audio/diarization's speaker embeddings."""
+    try:
+        gen_config = OV_DiarizationGenConfig(
+            audio_base64=base64.b64encode(await file.read()).decode("utf-8"), task="voiceprint",
+        )
+        return await _workers.diarize(model, gen_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Voiceprint failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Voiceprint failed: {str(exc)}")
 
 
 @router.post("/audio/speech", dependencies=[Depends(verify_api_key)])

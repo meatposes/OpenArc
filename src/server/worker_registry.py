@@ -14,12 +14,14 @@ from src.engine.ov_genai.vlm import OVGenAI_VLM
 from src.engine.ov_genai.whisper import OVGenAI_Whisper
 from src.engine.audio import AudioDecodeError
 from src.engine.openvino.kokoro import OV_Kokoro
+from src.engine.openvino.pyannote.diarization import OV_PyannoteDiarization
 from src.engine.openvino.qwen3_asr.qwen3_asr import OVQwen3ASR
 from src.engine.openvino.qwen3_tts.qwen3_tts import OVQwen3TTS
 from src.engine.optimum.optimum_emb import Optimum_EMB
 from src.engine.optimum.optimum_rr import Optimum_RR
 
 from src.server.schemas.modeling.contract_kokoro import OV_KokoroGenConfig
+from src.server.schemas.modeling.contract_diarization import OV_DiarizationGenConfig
 from src.server.schemas.modeling.contract_qwen3asr import OV_Qwen3ASRGenConfig
 from src.server.schemas.modeling.contract_qwen3tts import OV_Qwen3TTSGenConfig
 from src.server.schemas.modeling.contract_ovgenai_llm_and_vlm import OVGenAI_GenConfig
@@ -65,12 +67,14 @@ class WorkerPacket:
         OVGenAI_WhisperGenConfig,
         OV_Qwen3ASRGenConfig,
         OV_KokoroGenConfig,
+        OV_DiarizationGenConfig,
         OV_Qwen3TTSGenConfig,
         PreTrainedTokenizerConfig,
     ]
     response: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
     segments: Optional[List[Dict[str, Any]]] = None
+    result: Optional[Dict[str, Any]] = None  # structured results (diarization)
     # A bad request (e.g. undecodable audio): fail this request, keep the model loaded.
     request_error: Optional[BaseException] = None
     # Orchestration plumbing
@@ -226,6 +230,22 @@ class InferWorker:
             packet.request_error = e
         except Exception as e:
             logger.error("Whisper inference failed!", exc_info=True)
+            _mark_inference_error(packet, e)
+
+        return packet
+
+    @staticmethod
+    async def infer_diarization(packet: WorkerPacket, diar_model: OV_PyannoteDiarization) -> WorkerPacket:
+        """Diarize audio (or build a voiceprint) for a single packet."""
+        try:
+            assert isinstance(packet.gen_config, OV_DiarizationGenConfig), "Expected OV_DiarizationGenConfig for diarization"
+            packet.result = await diar_model.diarize(packet.gen_config)
+            packet.metrics = packet.result.get("metrics")
+        except ValueError as e:
+            # bad input (undecodable or too short audio): fail the request, keep the model loaded
+            packet.request_error = e
+        except Exception as e:
+            logger.error("Diarization inference failed!", exc_info=True)
             _mark_inference_error(packet, e)
 
         return packet
@@ -452,6 +472,27 @@ class QueueWorker:
             model_queue.task_done()
 
     @staticmethod
+    async def queue_worker_diarization(model_name: str, model_queue: asyncio.Queue, diar_model: OV_PyannoteDiarization, registry: ModelRegistry):
+        """Diarization model inference worker that processes packets from queue."""
+        logger.info(f"[Diarization Worker: {model_name}] Started, waiting for packets...")
+        while True:
+            packet = await model_queue.get()
+            if packet is None:
+                logger.info(f"[Diarization Worker: {model_name}] Shutdown signal received.")
+                break
+
+            completed_packet = await InferWorker.infer_diarization(packet, diar_model)
+
+            if completed_packet.metrics:
+                logger.info(f"[Diarization Worker: {model_name}] Metrics: {completed_packet.metrics}")
+
+            if _commit_completed_packet(packet, completed_packet, model_name, registry):
+                model_queue.task_done()
+                break
+
+            model_queue.task_done()
+
+    @staticmethod
     async def queue_worker_qwen3_asr(model_name: str, model_queue: asyncio.Queue, asr_model: OVQwen3ASR, registry: ModelRegistry):
         """Qwen3 ASR model inference worker that processes packets from queue."""
         logger.info(f"[Qwen3ASR Worker: {model_name}] Started, waiting for packets...")
@@ -582,6 +623,8 @@ class WorkerRegistry:
         self._model_tasks_qwen3_asr: Dict[str, asyncio.Task] = {}
 
         self._model_queues_kokoro: Dict[str, asyncio.Queue] = {}
+        self._model_queues_diarization: Dict[str, asyncio.Queue] = {}
+        self._model_tasks_diarization: Dict[str, asyncio.Task] = {}
         self._model_tasks_kokoro: Dict[str, asyncio.Task] = {}
 
         self._model_queues_qwen3_tts: Dict[str, asyncio.Queue] = {}
@@ -655,6 +698,15 @@ class WorkerRegistry:
                     task = asyncio.create_task(QueueWorker.queue_worker_kokoro(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_kokoro[record.model_name] = task
 
+            elif mt == ModelType.DIARIZATION and isinstance(instance, OV_PyannoteDiarization):
+                if record.model_name not in self._model_queues_diarization:
+                    q = asyncio.Queue()
+                    self._model_queues_diarization[record.model_name] = q
+                    task = asyncio.create_task(
+                        QueueWorker.queue_worker_diarization(record.model_name, q, instance, self._model_registry)
+                    )
+                    self._model_tasks_diarization[record.model_name] = task
+
             elif mt in (
                 ModelType.QWEN3_TTS_CUSTOM_VOICE,
                 ModelType.QWEN3_TTS_VOICE_DESIGN,
@@ -726,6 +778,14 @@ class WorkerRegistry:
             if t is not None and not t.done():
                 t.cancel()
 
+            # Try diarization dicts
+            q = self._model_queues_diarization.pop(record.model_name, None)
+            t = self._model_tasks_diarization.pop(record.model_name, None)
+            if q is not None:
+                await q.put(None)
+            if t is not None and not t.done():
+                t.cancel()
+
             # Try qwen3_tts dicts
             q = self._model_queues_qwen3_tts.pop(record.model_name, None)
             t = self._model_tasks_qwen3_tts.pop(record.model_name, None)
@@ -776,6 +836,12 @@ class WorkerRegistry:
         if q is not None:
             return q
         raise ValueError(f"Kokoro model '{model_name}' is not loaded or no worker is available")
+
+    def _get_diarization_queue(self, model_name: str) -> asyncio.Queue:
+        q = self._model_queues_diarization.get(model_name)
+        if q is not None:
+            return q
+        raise ValueError(f"Diarization model '{model_name}' is not loaded or no worker is available")
 
     def _get_qwen3_tts_queue(self, model_name: str) -> asyncio.Queue:
         q = self._model_queues_qwen3_tts.get(model_name)
@@ -935,6 +1001,20 @@ class WorkerRegistry:
             response["segments"] = completed.segments
         
         return response
+
+    async def diarize(self, model_name: str, gen_config: OV_DiarizationGenConfig) -> Dict[str, Any]:
+        """Diarize audio, or build a voiceprint, with a loaded diarization model."""
+        result_future: asyncio.Future[WorkerPacket] = asyncio.get_running_loop().create_future()
+        packet = WorkerPacket(
+            request_id=uuid.uuid4().hex,
+            id_model=model_name,
+            gen_config=gen_config,
+            result_future=result_future,
+        )
+        q = self._get_diarization_queue(model_name)
+        await q.put(packet)
+        completed = await result_future
+        return completed.result or {}
 
     async def generate_speech_qwen3_tts(self, model_name: str, gen_config: OV_Qwen3TTSGenConfig) -> Dict[str, Any]:
         """Generate speech using a loaded Qwen3 TTS model.
