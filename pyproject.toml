@@ -33,9 +33,16 @@ dependencies = [
     "sounddevice>=0.5.2",
     "soundfile>=0.13.1",
     "torch>=2.11.0",
+    "torchcodec>=0.11.0",
     "torchvision>=0.26.0",
     "uvicorn>=0.35.0",
     "zensical>=0.0.31",
+]
+
+[project.optional-dependencies]
+# speaker diarization (model_type: diarization); pulls lightning, matplotlib, optuna
+diarization = [
+    "pyannote.audio>=4.0.7",
 ]
 
 [dependency-groups]

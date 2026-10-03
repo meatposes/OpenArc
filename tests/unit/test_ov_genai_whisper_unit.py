@@ -55,19 +55,16 @@ def _sample_audio_base64() -> str:
     return base64.b64encode(b"audio-bytes").decode("ascii")
 
 
-def test_prepare_audio_calls_librosa(monkeypatch: pytest.MonkeyPatch, load_config: ModelLoadConfig) -> None:
+def test_prepare_audio_uses_shared_decoder(monkeypatch: pytest.MonkeyPatch, load_config: ModelLoadConfig) -> None:
     whisper = OVGenAI_Whisper(load_config)
     audio_array = np.array([0.1, -0.2], dtype=np.float32)
 
-    load_mock = MagicMock(return_value=(audio_array, 16000))
-    monkeypatch.setattr(whisper_module.librosa, "load", load_mock)
+    decode_mock = MagicMock(return_value=audio_array)
+    monkeypatch.setattr(whisper_module, "decode_audio", decode_mock)
 
     audio_list = whisper.prepare_audio(OVGenAI_WhisperGenConfig(audio_base64=_sample_audio_base64()))
 
-    load_mock.assert_called_once()
-    _, kwargs = load_mock.call_args
-    assert kwargs["sr"] == 16000
-    assert kwargs["mono"] is True
+    decode_mock.assert_called_once_with(b"audio-bytes")
     assert audio_list == audio_array.tolist()
 
 

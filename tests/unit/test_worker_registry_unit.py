@@ -7,6 +7,7 @@ import src.server.worker_registry as worker_module
 from src.server.model_registry import ModelRecord, ModelRegistry
 from src.server.schemas.registration import ModelType
 from src.server.schemas.modeling.contract_kokoro import KokoroLanguage, KokoroVoice, OV_KokoroGenConfig
+from src.server.schemas.modeling.contract_diarization import OV_DiarizationGenConfig
 from src.server.schemas.modeling.contract_qwen3asr import OV_Qwen3ASRGenConfig
 from src.server.schemas.modeling.contract_optimum_emb import PreTrainedTokenizerConfig
 from src.server.schemas.modeling.contract_optimum_rerank import RerankerConfig
@@ -51,6 +52,9 @@ def worker_registry(monkeypatch: pytest.MonkeyPatch) -> worker_module.WorkerRegi
     class DummyQwen3ASR:  # noqa: D401
         pass
 
+    class DummyDiarization:  # noqa: D401
+        pass
+
     class DummyEmb:  # noqa: D401
         pass
 
@@ -62,6 +66,7 @@ def worker_registry(monkeypatch: pytest.MonkeyPatch) -> worker_module.WorkerRegi
     monkeypatch.setattr(worker_module, "OVGenAI_Whisper", DummyWhisper)
     monkeypatch.setattr(worker_module, "OV_Kokoro", DummyKokoro)
     monkeypatch.setattr(worker_module, "OVQwen3ASR", DummyQwen3ASR)
+    monkeypatch.setattr(worker_module, "OV_PyannoteDiarization", DummyDiarization)
     monkeypatch.setattr(worker_module, "Optimum_EMB", DummyEmb)
     monkeypatch.setattr(worker_module, "Optimum_RR", DummyRR)
 
@@ -112,6 +117,7 @@ def _make_record(model_type: ModelType, model_name: str) -> ModelRecord:
         ModelType.WHISPER: "ov_genai",
         ModelType.QWEN3_ASR: "openvino",
         ModelType.KOKORO: "openvino",
+        ModelType.DIARIZATION: "openvino",
         ModelType.EMB: "ov_optimum",
         ModelType.RERANK: "ov_optimum",
     }
@@ -121,6 +127,7 @@ def _make_record(model_type: ModelType, model_name: str) -> ModelRecord:
         ModelType.WHISPER: worker_module.OVGenAI_Whisper,
         ModelType.QWEN3_ASR: worker_module.OVQwen3ASR,
         ModelType.KOKORO: worker_module.OV_Kokoro,
+        ModelType.DIARIZATION: worker_module.OV_PyannoteDiarization,
         ModelType.EMB: worker_module.Optimum_EMB,
         ModelType.RERANK: worker_module.Optimum_RR,
     }
@@ -483,3 +490,37 @@ def test_commit_request_error_fails_future_and_keeps_worker() -> None:
     with pytest.raises(ValueError, match="bad audio"):
         fut.result()
     registry.register_unload.assert_not_called()
+
+def test_diarize_returns_structured_result(worker_registry: worker_module.WorkerRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeDiar:
+        async def diarize(self, cfg):
+            return {"turns": [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}], "metrics": {"realtime_factor": 50.0}}
+
+    record = _make_record(ModelType.DIARIZATION, "diar-model")
+
+    async def worker(model_name, q, instance, registry):
+        while (packet := await q.get()) is not None:
+            done = await worker_module.InferWorker.infer_diarization(packet, FakeDiar())  # type: ignore[arg-type]
+            packet.result_future.set_result(done)
+
+    monkeypatch.setattr(worker_module.QueueWorker, "queue_worker_diarization", worker)
+    cfg = OV_DiarizationGenConfig(audio_base64="AAA")
+
+    async def _run():
+        return await _load_and_call(worker_registry, record, worker_registry.diarize("diar-model", cfg))
+
+    result = asyncio.run(_run())
+    assert result["turns"][0]["speaker"] == "SPEAKER_00"
+    assert result["metrics"] == {"realtime_factor": 50.0}
+
+
+def test_infer_diarization_bad_audio_fails_request_not_model() -> None:
+    class BadInput:
+        async def diarize(self, cfg):
+            raise ValueError("Unreadable audio: nope")
+
+    packet = worker_module.WorkerPacket(request_id="r", id_model="d", gen_config=OV_DiarizationGenConfig(audio_base64="AAA"))
+    done = asyncio.run(worker_module.InferWorker.infer_diarization(packet, BadInput()))  # type: ignore[arg-type]
+    assert done.error is None                     # no error -> the model is not unloaded
+    assert isinstance(done.request_error, ValueError)
+
