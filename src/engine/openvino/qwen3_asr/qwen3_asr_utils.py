@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
-import io
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Tuple, Union
@@ -22,9 +21,8 @@ from urllib.parse import urlparse
 
 import librosa
 import numpy as np
-import soundfile as sf
 
-from src.engine.audio import AudioDecodeError
+from src.engine.audio import decode_audio
 
 AudioLike = Union[
     str,                      # wav path / URL / base64
@@ -200,30 +198,16 @@ def decode_base64_bytes(b64: str) -> bytes:
 
 
 def load_audio_any(x: str) -> Tuple[np.ndarray, int]:
-    try:
-        return _load_audio_any(x)
-    except AudioDecodeError:
-        raise
-    except Exception as e:
-        raise AudioDecodeError(f"Unreadable audio: {e}") from e
-
-
-def _load_audio_any(x: str) -> Tuple[np.ndarray, int]:
     if is_url(x):
         with urllib.request.urlopen(x) as resp:
             audio_bytes = resp.read()
-        with io.BytesIO(audio_bytes) as f:
-            audio, sr = sf.read(f, dtype="float32", always_2d=False)
     elif is_probably_base64(x):
         audio_bytes = decode_base64_bytes(x)
-        with io.BytesIO(audio_bytes) as f:
-            audio, sr = sf.read(f, dtype="float32", always_2d=False)
     else:
-        audio, sr = librosa.load(x, sr=None, mono=False)
-
-    audio = np.asarray(audio, dtype=np.float32)
-    sr = int(sr)
-    return audio, sr
+        with open(x, "rb") as f:
+            audio_bytes = f.read()
+    # decoded straight to mono at SAMPLE_RATE, so to_mono/resample below are no-ops
+    return decode_audio(audio_bytes, SAMPLE_RATE), SAMPLE_RATE
 
 
 def to_mono(audio: np.ndarray) -> np.ndarray:

@@ -51,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     build-essential \
     libudev-dev \
+    libavcodec60 libavformat60 libavutil58 libswresample4 libavdevice60 libavfilter9 libswscale7 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
     && rm -rf /var/lib/apt/lists/*
 

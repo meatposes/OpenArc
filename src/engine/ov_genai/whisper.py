@@ -1,15 +1,13 @@
 import asyncio
 import base64
 import gc
-import io
 import logging
 from typing import Any, AsyncIterator, Dict, Union
 
-import librosa
 import numpy as np
 from openvino_genai import WhisperPipeline
 
-from src.engine.audio import AudioDecodeError
+from src.engine.audio import decode_audio
 from src.server.model_registry import ModelRegistry
 from src.server.schemas.registration import ModelLoadConfig
 from src.server.schemas.modeling.contract_whisper import OVGenAI_WhisperGenConfig
@@ -28,16 +26,8 @@ class OVGenAI_Whisper:
         Prepare audio inputs from base64 string for the Whisper pipeline.
         """
 
-        audio_bytes = base64.b64decode(gen_config.audio_base64)
-        
-        audio_buffer = io.BytesIO(audio_bytes)
-        
-        try:
-            audio, sr = librosa.load(audio_buffer, sr=16000, mono=True)
-        except Exception as e:
-            raise AudioDecodeError(f"Unreadable audio: {e}") from e
-
-        return audio.astype(np.float32).tolist()
+        audio = decode_audio(base64.b64decode(gen_config.audio_base64))
+        return audio.tolist()
 
     async def transcribe(self, gen_config: OVGenAI_WhisperGenConfig) -> AsyncIterator[Union[Dict[str, Any], str]]:
         """
