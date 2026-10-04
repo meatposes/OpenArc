@@ -497,8 +497,8 @@ def parse_asr_output(
     s = detect_and_fix_repetitions(s)
 
     if language:
-        # the language is not part of the prompt, so the model still prefixes its own
-        # "language X<asr_text>" tag; drop it and report the requested language
+        # the forced language is part of the prompt, so the model should write only the
+        # transcript; drop a "language X<asr_text>" tag anyway if one slips through
         if _ASR_TEXT_TAG in s:
             s = s.split(_ASR_TEXT_TAG, 1)[1].strip()
         return language, s

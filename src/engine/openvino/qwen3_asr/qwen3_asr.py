@@ -187,6 +187,32 @@ class Qwen3ASRHelpers:
         return id_to_token, special_tokens, byte_dec
 
     @staticmethod
+    def load_bpe(tokenizer_dir: str) -> tuple[dict[str, int], dict[tuple[str, str], int]]:
+        """vocab (token -> id) and BPE merge ranks, for encoding the few words the prompt needs."""
+        with open(os.path.join(tokenizer_dir, "vocab.json"), "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+        ranks: dict[tuple[str, str], int] = {}
+        with open(os.path.join(tokenizer_dir, "merges.txt"), "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(" ")
+                if len(parts) == 2 and not line.startswith("#version"):
+                    ranks[(parts[0], parts[1])] = len(ranks)
+        return vocab, ranks
+
+    @staticmethod
+    def bpe_encode(word: str, vocab: dict[str, int], ranks: dict[tuple[str, str], int]) -> list[int]:
+        """Byte-level BPE for one pre-token (e.g. " Macedonian"), as the Qwen tokenizer does it."""
+        byte_enc = Qwen3ASRHelpers.bytes_to_unicode()
+        parts = [byte_enc[b] for b in word.encode("utf-8")]
+        while len(parts) > 1:
+            pairs = [(ranks.get((a, b), 1 << 30), i) for i, (a, b) in enumerate(zip(parts, parts[1:]))]
+            rank, i = min(pairs)
+            if rank == 1 << 30:
+                break
+            parts[i:i + 2] = [parts[i] + parts[i + 1]]
+        return [vocab[p] for p in parts]
+
+    @staticmethod
     def decode_tokens_cached(
         token_ids,
         id_to_token: dict,
@@ -256,7 +282,17 @@ class OVQwen3ASR:
             self._tok_special,
             self._tok_byte_dec,
         ) = Qwen3ASRHelpers.load_tokenizer_state(str(self.ov_dir))
+        self._tok_vocab, self._bpe_ranks = Qwen3ASRHelpers.load_bpe(str(self.ov_dir))
         self.t_model_load = time.perf_counter() - t_load_start
+
+    def language_prompt(self, language: Optional[str]) -> list[int]:
+        """Tokens that force the output language: the assistant turn starts with
+        "language <Name><asr_text>", so the model writes only the transcript, in that language."""
+        if not language:
+            return []
+        return (Qwen3ASRHelpers.bpe_encode("language", self._tok_vocab, self._bpe_ranks)
+                + Qwen3ASRHelpers.bpe_encode(" " + language, self._tok_vocab, self._bpe_ranks)
+                + [TOKEN_ASR_TEXT])
 
     def _embed_tokens(self, token_ids):
         ids = np.asarray(token_ids, dtype=np.int64)
@@ -293,7 +329,7 @@ class OVQwen3ASR:
             "encoder_tokens": encoder_tokens,
         }
 
-    def audio_chunks(self, chunk_audio: np.ndarray, max_tokens: int):
+    def audio_chunks(self, chunk_audio: np.ndarray, max_tokens: int, language: Optional[str] = None):
         t_feature_start = time.perf_counter()
         mel = Qwen3ASRHelpers.compute_mel_spectrogram(chunk_audio, self._mel_filters_t, self._hann_window)
         t_feature = time.perf_counter() - t_feature_start
@@ -313,7 +349,7 @@ class OVQwen3ASR:
         audio_embeds = audio_embeds[0, :expected_tokens, :]
         n_audio = audio_embeds.shape[0]
 
-        input_ids = PROMPT_PREFIX + [TOKEN_AUDIO_PAD] * n_audio + PROMPT_SUFFIX
+        input_ids = PROMPT_PREFIX + [TOKEN_AUDIO_PAD] * n_audio + PROMPT_SUFFIX + self.language_prompt(language)
         input_embeds = self._embed_tokens(input_ids)[0].copy()
         pad_start = len(PROMPT_PREFIX)
         input_embeds[pad_start:pad_start + n_audio] = audio_embeds
@@ -418,7 +454,7 @@ class OVQwen3ASR:
                 f"offset={chunk_offset_sec:.2f}s duration={chunk_sec:.2f}s"
             )
             raw, chunk_metrics = await asyncio.to_thread(
-                self.audio_chunks, chunk_wav, gen_config.max_tokens
+                self.audio_chunks, chunk_wav, gen_config.max_tokens, language
             )
             lang, text = parse_asr_output(raw, language=language)
             langs.append(lang)
