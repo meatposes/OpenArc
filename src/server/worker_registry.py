@@ -70,7 +70,7 @@ class WorkerPacket:
     response: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
     segments: Optional[List[Dict[str, Any]]] = None
-    details: Optional[Dict[str, Any]] = None  # whisper: language, duration, segments, words, score
+    details: Optional[Dict[str, Any]] = None  # whisper: language, duration, segments, words
     # Orchestration plumbing
     result_future: Optional[asyncio.Future] = None
     stream_queue: Optional[asyncio.Queue] = None

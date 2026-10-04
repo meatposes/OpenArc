@@ -180,16 +180,16 @@ def test_english_only_model_ignores_other_languages(load_config: ModelLoadConfig
     assert cfg.language is None and not cfg.word_timestamps       # no crash, no unload
 
 
-def test_details_report_language_segments_words_score(load_config: ModelLoadConfig) -> None:
+def test_details_report_language_segments_words(load_config: ModelLoadConfig) -> None:
     from types import SimpleNamespace as NS
     whisper = OVGenAI_Whisper(load_config)
     whisper.whisper_model = MagicMock()
     whisper.whisper_model.get_generation_config.return_value = _Cfg()
-    result = NS(languages=["<|pl|>"], scores=[-3.21],
+    result = NS(languages=["<|pl|>"],
                 chunks=[NS(start_ts=0.0, end_ts=1.5, text=" Kocham cię.")],
                 words=[NS(word=" Kocham", start_ts=0.0, end_ts=0.6), NS(word=" cię.", start_ts=0.6, end_ts=1.1)])
     d = whisper._details(result, OVGenAI_WhisperGenConfig(audio_base64="AAA"), 1.5)
-    assert d["language"] == "polish" and d["language_code"] == "pl" and d["score"] == -3.21
+    assert d["language"] == "polish" and d["language_code"] == "pl"
     assert d["segments"] == [{"id": 0, "start": 0.0, "end": 1.5, "text": "Kocham cię."}]
     assert [w["word"] for w in d["words"]] == ["Kocham", "cię."]
 

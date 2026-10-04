@@ -78,7 +78,8 @@ class OVGenAI_Whisper:
         yield self._details(result, gen_config, len(audio_list) / 16000)
 
     def _details(self, result, gen_config: OVGenAI_WhisperGenConfig, duration: float) -> Dict[str, Any]:
-        """The OpenAI verbose_json fields: detected language, segments, words; plus the score."""
+        """The OpenAI verbose_json fields: language, duration, segments, words. OpenVINO GenAI does not
+        report the language Whisper detected, so language is only known when it was forced."""
         langs = getattr(result, "languages", None) or []
         code = to_code(gen_config.language) or from_token(langs[0] if langs else None)
         if code is None and not self.whisper_model.get_generation_config().is_multilingual:
@@ -87,14 +88,12 @@ class OVGenAI_Whisper:
                     for i, c in enumerate(getattr(result, "chunks", None) or [])]
         words = [{"word": w.word.strip(), "start": round(w.start_ts, 3), "end": round(w.end_ts, 3)}
                  for w in (getattr(result, "words", None) or [])]
-        scores = list(getattr(result, "scores", None) or [])
         return {
             "language": LANGUAGES.get(code, code) if code else None,
             "language_code": code,
             "duration": round(duration, 3),
             "segments": segments,
             "words": words,
-            "score": round(float(scores[0]), 4) if scores else None,
         }
 
     def collect_metrics(self, perf_metrics) -> dict:

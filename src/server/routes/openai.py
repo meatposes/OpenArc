@@ -626,7 +626,6 @@ async def openai_audio_transcriptions(
                        "text": result.get("text", "").strip(), "segments": details.get("segments", [])}
                 if "word" in grains:
                     out["words"] = details.get("words", [])
-                out["score"] = details.get("score")
                 return out
 
         metrics: Dict[str, Any] = result.get("metrics", {})
