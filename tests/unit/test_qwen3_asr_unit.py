@@ -185,3 +185,22 @@ def test_parse_asr_output_strips_tag_when_language_forced() -> None:
     assert parse_asr_output("language English<asr_text>Hello there.", language="English") == ("English", "Hello there.")
     assert parse_asr_output("Hello there.", language="English") == ("English", "Hello there.")
 
+
+def test_bpe_encode_merges_by_rank() -> None:
+    from src.engine.openvino.qwen3_asr.qwen3_asr import Qwen3ASRHelpers
+
+    vocab = {"Ġ": 1, "M": 2, "a": 3, "c": 4, "ĠM": 5, "ac": 6, "ĠMac": 7, "language": 8}
+    ranks = {("a", "c"): 0, ("Ġ", "M"): 1, ("ĠM", "ac"): 2}
+    assert Qwen3ASRHelpers.bpe_encode(" Mac", vocab, ranks) == [7]
+    assert Qwen3ASRHelpers.bpe_encode(" Ma", vocab, ranks) == [5, 3]
+
+
+def test_language_prompt_tokens(monkeypatch) -> None:
+    from src.engine.openvino.qwen3_asr import qwen3_asr as q
+
+    encoded = {"language": [10], " Polish": [20, 21]}
+    monkeypatch.setattr(q.Qwen3ASRHelpers, "bpe_encode", staticmethod(lambda w, v, r: encoded[w]))
+    asr = q.OVQwen3ASR.__new__(q.OVQwen3ASR)
+    asr._tok_vocab, asr._bpe_ranks = {}, {}
+    assert asr.language_prompt(None) == []
+    assert asr.language_prompt("Polish") == [10, 20, 21, q.TOKEN_ASR_TEXT]
