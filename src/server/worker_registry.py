@@ -77,6 +77,7 @@ class WorkerPacket:
     result: Optional[Dict[str, Any]] = None  # structured results (diarization)
     # A bad request (e.g. undecodable audio): fail this request, keep the model loaded.
     request_error: Optional[BaseException] = None
+    details: Optional[Dict[str, Any]] = None  # whisper: language, duration, segments, words
     # Orchestration plumbing
     result_future: Optional[asyncio.Future] = None
     stream_queue: Optional[asyncio.Queue] = None
@@ -219,7 +220,10 @@ class InferWorker:
         try:
             async for item in whisper_model.transcribe(packet.gen_config):
                 if isinstance(item, dict):
-                    metrics = item
+                    if metrics is None:
+                        metrics = item
+                    else:
+                        packet.details = item
                 else:
                     final_text = item
 
@@ -1003,7 +1007,10 @@ class WorkerRegistry:
         q = self._get_whisper_queue(model_name)
         await q.put(packet)
         completed = await result_future
-        return {"text": completed.response or "", "metrics": completed.metrics or {}}
+        out = {"text": completed.response or "", "metrics": completed.metrics or {}}
+        if completed.details:
+            out["details"] = completed.details
+        return out
 
     async def transcribe_qwen3_asr(self, model_name: str, gen_config: OV_Qwen3ASRGenConfig) -> Dict[str, Any]:
         """Transcribe audio using Qwen3 ASR model."""

@@ -97,6 +97,7 @@ def test_transcribe_yields_metrics_and_text(monkeypatch: pytest.MonkeyPatch, loa
 
     whisper.whisper_model = MagicMock()
     whisper.whisper_model.generate.return_value = result
+    whisper.word_timestamps_enabled = False
 
     gen_config = OVGenAI_WhisperGenConfig(audio_base64=_sample_audio_base64())
 
@@ -108,11 +109,13 @@ def test_transcribe_yields_metrics_and_text(monkeypatch: pytest.MonkeyPatch, loa
 
     outputs = asyncio.run(_run_test())
 
-    assert len(outputs) == 2
-    metrics, text = outputs
+    assert len(outputs) == 3
+    metrics, text, details = outputs
     assert isinstance(metrics, dict)
     assert text == "hello world"
-    whisper.whisper_model.generate.assert_called_once_with([0.1, 0.2])
+    assert details["duration"] == round(2 / 16000, 3)
+    args = whisper.whisper_model.generate.call_args.args
+    assert args[0] == [0.1, 0.2]                                    # audio, then the generation config
     prepare_mock.assert_called_once_with(gen_config)
 
 
@@ -124,12 +127,75 @@ def test_load_model_initializes_pipeline(monkeypatch: pytest.MonkeyPatch, load_c
 
     whisper.load_model(load_config)
 
+    # word timestamps are requested at load; the pipeline is built once when the model supports them
     pipeline_factory.assert_called_once_with(
         load_config.model_path,
         load_config.device,
+        word_timestamps=True,
         **load_config.runtime_config,
     )
-    assert whisper.whisper_model is pipeline_instance
+    assert whisper.whisper_model is pipeline_instance and whisper.word_timestamps_enabled
+
+
+def test_load_model_falls_back_without_word_timestamps(monkeypatch: pytest.MonkeyPatch, load_config: ModelLoadConfig) -> None:
+    whisper = OVGenAI_Whisper(load_config)
+    plain = MagicMock()
+
+    def factory(*args, **kwargs):
+        if kwargs.get("word_timestamps"):
+            raise RuntimeError("model has no alignment heads")
+        return plain
+    monkeypatch.setattr(whisper_module, "WhisperPipeline", factory)
+    whisper.load_model(load_config)
+    assert whisper.whisper_model is plain and not whisper.word_timestamps_enabled
+
+
+class _Cfg:
+    def __init__(self, multilingual=True):
+        self.is_multilingual = multilingual
+        self.language = None
+        self.task = None
+        self.return_timestamps = False
+        self.word_timestamps = False
+
+
+def test_generation_config_forces_language_and_timestamps(load_config: ModelLoadConfig) -> None:
+    whisper = OVGenAI_Whisper(load_config)
+    whisper.whisper_model = MagicMock()
+    whisper.whisper_model.get_generation_config.return_value = _Cfg()
+    whisper.word_timestamps_enabled = True
+    cfg = whisper._generation_config(OVGenAI_WhisperGenConfig(audio_base64="AAA", language="Polish", word_timestamps=True))
+    assert cfg.language == "<|pl|>" and cfg.return_timestamps and cfg.word_timestamps
+
+
+def test_english_only_model_ignores_other_languages(load_config: ModelLoadConfig) -> None:
+    whisper = OVGenAI_Whisper(load_config)
+    whisper.whisper_model = MagicMock()
+    whisper.whisper_model.get_generation_config.return_value = _Cfg(multilingual=False)
+    whisper.word_timestamps_enabled = False
+    cfg = whisper._generation_config(OVGenAI_WhisperGenConfig(audio_base64="AAA", language="pl", word_timestamps=True))
+    assert cfg.language is None and not cfg.word_timestamps       # no crash, no unload
+
+
+def test_details_report_language_segments_words(load_config: ModelLoadConfig) -> None:
+    from types import SimpleNamespace as NS
+    whisper = OVGenAI_Whisper(load_config)
+    whisper.whisper_model = MagicMock()
+    whisper.whisper_model.get_generation_config.return_value = _Cfg()
+    result = NS(languages=["<|pl|>"],
+                chunks=[NS(start_ts=0.0, end_ts=1.5, text=" Kocham cię.")],
+                words=[NS(word=" Kocham", start_ts=0.0, end_ts=0.6), NS(word=" cię.", start_ts=0.6, end_ts=1.1)])
+    d = whisper._details(result, OVGenAI_WhisperGenConfig(audio_base64="AAA"), 1.5)
+    assert d["language"] == "polish" and d["language_code"] == "pl"
+    assert d["segments"] == [{"id": 0, "start": 0.0, "end": 1.5, "text": "Kocham cię."}]
+    assert [w["word"] for w in d["words"]] == ["Kocham", "cię."]
+
+
+def test_language_codes() -> None:
+    from src.engine.ov_genai.whisper_languages import to_code
+    assert to_code("English") == "en" and to_code("PL") == "pl" and to_code("<|de|>") == "de" and to_code(None) is None
+    with pytest.raises(ValueError):
+        to_code("Klingon")
 
 
 def test_unload_model_resets_state(monkeypatch: pytest.MonkeyPatch, load_config: ModelLoadConfig) -> None:
