@@ -458,3 +458,29 @@ def test_stream_chunks_shortens_only_the_first_chunk(load_config: ModelLoadConfi
     assert len(chunks[0]) <= kokoro_module.STREAM_FIRST_CHUNK_CHARS
     assert " ".join(chunks).split() == text.split()
     assert kokoro._stream_chunks("Short. Text.", 400) == kokoro.make_chunks("Short. Text.", 400)
+
+
+@pytest.mark.parametrize("api", ["hooks", "parametrizations"])
+def test_remove_weight_norm_handles_both_torch_apis(api: str) -> None:
+    from torch.nn.utils import parametrize
+
+    torch.manual_seed(0)
+    conv = torch.nn.Conv1d(4, 4, 3)
+    wn = torch.nn.utils.weight_norm if api == "hooks" else torch.nn.utils.parametrizations.weight_norm
+    model = torch.nn.Sequential(wn(conv))
+    x = torch.randn(1, 4, 16)
+    with torch.no_grad():
+        before = model(x)
+        effective = model[0].weight.detach().clone()
+
+    kokoro_module._remove_weight_norm(model)
+
+    assert not parametrize.is_parametrized(model[0], "weight")
+    assert not any(type(h).__name__ == "WeightNorm" for h in model[0]._forward_pre_hooks.values())
+    assert isinstance(model[0].weight, torch.nn.Parameter)
+    assert torch.equal(model[0].weight.detach(), effective)
+    with torch.no_grad():
+        torch.testing.assert_close(model(x), before)
+        model[0].weight.mul_(2)          # folding edits the real weight now, not a computed one
+        assert not torch.allclose(model(x), before)
+
