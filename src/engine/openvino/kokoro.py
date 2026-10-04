@@ -141,10 +141,17 @@ class _PolyphaseConvTranspose1d(nn.Module):
 
 
 def _remove_weight_norm(module: nn.Module) -> None:
+    """Bake weight norm into plain weights. Handles both the old hook API (kokoro 0.9.4) and
+    torch.nn.utils.parametrizations.weight_norm, which unreleased kokoro already uses; without the
+    second, the folding below would edit a computed property and silently change nothing."""
+    from torch.nn.utils import parametrize
+
     for m in module.modules():
         for hook in list(m._forward_pre_hooks.values()):
             if type(hook).__name__ == "WeightNorm":
                 nn.utils.remove_weight_norm(m)
+        if parametrize.is_parametrized(m, "weight"):
+            parametrize.remove_parametrizations(m, "weight", leave_parametrized=True)
 
 
 def _resblock1_folded_forward(self, x, s):
