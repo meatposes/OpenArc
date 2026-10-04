@@ -177,3 +177,11 @@ def test_every_mapped_code_resolves_to_a_supported_language() -> None:
         assert name in SUPPORTED_LANGUAGES, f"{code} -> {name} not in SUPPORTED_LANGUAGES"
         # Resolved canonical names must pass validation.
         validate_language(resolve_language_name(code))
+
+
+def test_parse_asr_output_strips_tag_when_language_forced() -> None:
+    from src.engine.openvino.qwen3_asr.qwen3_asr_utils import parse_asr_output
+
+    assert parse_asr_output("language English<asr_text>Hello there.", language="English") == ("English", "Hello there.")
+    assert parse_asr_output("Hello there.", language="English") == ("English", "Hello there.")
+
