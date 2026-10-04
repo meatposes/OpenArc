@@ -26,6 +26,7 @@ from src.server.schemas.modeling.contract_qwen3tts import (
     OV_Qwen3TTSVoiceDesign,
 )
 from src.server.schemas.modeling.contract_whisper import OVGenAI_WhisperGenConfig
+from src.engine.ov_genai.whisper_languages import to_code as whisper_language_code
 from src.server.schemas.registration import ModelLoadConfig, ModelType, ModelUnloadConfig
 from src.server.schemas.requests_internal import OpenArcBenchRequest
 from src.server.schemas.requests_openai import (
@@ -559,6 +560,10 @@ async def openai_audio_transcriptions(
         ),
     ),
     response_format: Optional[str] = Form("json", description="Format of output"),
+    timestamp_granularities: Optional[List[str]] = Form(
+        None, alias="timestamp_granularities[]",
+        description="Whisper, with verbose_json: 'segment' and/or 'word'",
+    ),
     openarc_asr: Optional[str] = Form(
         None, description="JSON: OpenArcASRConfig with qwen3_asr params"
     ),
@@ -604,8 +609,25 @@ async def openai_audio_transcriptions(
             )
             result = await _workers.transcribe_qwen3_asr(model, gen_config)
         else:
-            gen_config = OVGenAI_WhisperGenConfig(audio_base64=audio_base64)
+            verbose = response_format == "verbose_json"
+            grains = set(timestamp_granularities or [])
+            if language:
+                whisper_language_code(language)        # unknown language -> 400, not a model failure
+            gen_config = OVGenAI_WhisperGenConfig(
+                audio_base64=audio_base64,
+                language=language or None,
+                return_timestamps=verbose,
+                word_timestamps=verbose and "word" in grains,
+            )
             result = await _workers.transcribe_whisper(model, gen_config)
+            details = result.get("details") or {}
+            if verbose:
+                out = {"task": "transcribe", "language": details.get("language"), "duration": details.get("duration"),
+                       "text": result.get("text", "").strip(), "segments": details.get("segments", [])}
+                if "word" in grains:
+                    out["words"] = details.get("words", [])
+                out["score"] = details.get("score")
+                return out
 
         metrics: Dict[str, Any] = result.get("metrics", {})
         logger.info(f"[audio/transcriptions] model={model} metrics={metrics}")
