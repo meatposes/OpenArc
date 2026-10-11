@@ -58,6 +58,14 @@ TOKEN_AUDIO_PAD = 151676
 TOKEN_ENDOFTEXT = 151643
 TOKEN_ASR_TEXT = 151704
 EOS_TOKEN_IDS = {TOKEN_ENDOFTEXT, TOKEN_IM_END}
+
+# Batched decoding. A decode step costs about the same for 1 or 8 sequences on a GPU (it is bound by
+# kernel launches, not bandwidth), so chunks from requests that arrive together are decoded together.
+# Rows of one batch must have the same prompt length (the decoder has no attention mask), so chunks of
+# similar length are padded with silence to the longest of their batch.
+MAX_BATCH = max(1, int(os.environ.get("OPENARC_ASR_MAX_BATCH", "16")))
+BATCH_PAD_SEC = 1.0         # chunks join a batch when the longest is at most this much longer...
+BATCH_PAD_SHARE = 0.35      # ...or this share of its length longer than the shortest
 PROMPT_PREFIX = [
     TOKEN_IM_START, 8948, 198, TOKEN_IM_END, 198,
     TOKEN_IM_START, 872, 198, TOKEN_AUDIO_START,
@@ -258,6 +266,38 @@ class OVQwen3ASR:
         self._tok_id_to_token: dict[Any, Any] | None = None
         self._tok_special: set[int] | None = None
         self._tok_byte_dec: dict[str, int] | None = None
+        self.max_batch = 1
+        self._pending: list[tuple[np.ndarray, int, Optional[str], asyncio.Future]] = []
+        self._runner: asyncio.Task | None = None
+
+    @staticmethod
+    def allow_batches(model: ov.Model) -> bool:
+        """Let the exported decoder (batch 1 everywhere) take any batch size: its KV-cache variables and
+        the reshapes that hard-code a batch of 1. RoPE and the causal mask are computed for one row and
+        broadcast, which is right because every row of a batch has the same positions."""
+        for v in model.get_variables():
+            info = v.info
+            dims = list(info.data_shape)
+            if not dims or dims[0].get_length() != 1:
+                return False
+            info.data_shape = ov.PartialShape([-1] + dims[1:])
+            v.update(info)
+        for n in model.get_ordered_ops():
+            if n.get_type_name() != "Reshape":
+                continue
+            src = n.input(1).get_source_output().get_node()
+            if src.get_type_name() != "Constant":
+                continue
+            target = src.get_data()
+            if target.ndim == 1 and target.size in (3, 4) and target[0] == 1:
+                if not n.get_special_zero():
+                    return False
+                target = target.copy()
+                target[0] = 0                       # 0 = keep the input's batch dimension
+                n.input(1).replace_source_output(ov.op.Constant(target).output(0))
+        model.reshape({model.inputs[0]: ov.PartialShape([-1, -1, model.inputs[0].get_partial_shape()[2]]),
+                       model.inputs[1]: ov.PartialShape([-1, -1])})
+        return True
 
     def load_model(self, load_config: ModelLoadConfig) -> None:
         self.load_config = load_config
@@ -272,10 +312,17 @@ class OVQwen3ASR:
             str(self.ov_dir / "thinker_embeddings_model.xml"),
             load_config.device,
         )
-        self.dec_model = self.core.compile_model(
-            str(self.ov_dir / "decoder_model.xml"),
-            load_config.device,
-        )
+        decoder = self.core.read_model(str(self.ov_dir / "decoder_model.xml"))
+        self.max_batch = 1
+        if MAX_BATCH > 1:
+            try:
+                if self.allow_batches(decoder):
+                    self.max_batch = MAX_BATCH
+            except Exception as e:  # noqa: BLE001 - an export this doesn't fit still works one at a time
+                logger.warning(f"[{load_config.model_name}] decoder can't batch ({e}); decoding one chunk at a time")
+                decoder = self.core.read_model(str(self.ov_dir / "decoder_model.xml"))
+        self.dec_model = self.core.compile_model(decoder, load_config.device)
+        logger.info(f"[{load_config.model_name}] decoding up to {self.max_batch} chunk(s) at once")
         self.dec_request = self.dec_model.create_infer_request()
         (
             self._tok_id_to_token,
@@ -329,7 +376,8 @@ class OVQwen3ASR:
             "encoder_tokens": encoder_tokens,
         }
 
-    def audio_chunks(self, chunk_audio: np.ndarray, max_tokens: int, language: Optional[str] = None):
+    def _prepare(self, chunk_audio: np.ndarray, language: Optional[str]) -> tuple[np.ndarray, dict]:
+        """The decoder's prompt for one chunk: the audio encoded and put between the prompt tokens."""
         t_feature_start = time.perf_counter()
         mel = Qwen3ASRHelpers.compute_mel_spectrogram(chunk_audio, self._mel_filters_t, self._hann_window)
         t_feature = time.perf_counter() - t_feature_start
@@ -353,10 +401,18 @@ class OVQwen3ASR:
         input_embeds = self._embed_tokens(input_ids)[0].copy()
         pad_start = len(PROMPT_PREFIX)
         input_embeds[pad_start:pad_start + n_audio] = audio_embeds
-        input_embeds = input_embeds[np.newaxis, :, :].astype(np.float32)
+        return input_embeds.astype(np.float32), {"feature_sec": t_feature, "encoder_sec": t_encoder,
+                                                 "encoder_tokens": expected_tokens}
 
-        prompt_len = len(input_ids)
-        position_ids = np.arange(prompt_len, dtype=np.int64)[np.newaxis, :]
+    def decode_batch(self, chunks: list[np.ndarray], max_tokens: int, language: Optional[str] = None):
+        """Transcribe several chunks in one pass (same language prompt). Shorter chunks are padded with
+        silence to the longest, so every row has the same prompt length. Returns [(raw text, metrics)]."""
+        longest = max(len(c) for c in chunks)
+        prepared = [self._prepare(np.pad(c, (0, longest - len(c))) if len(c) < longest else c, language) for c in chunks]
+        B = len(chunks)
+        input_embeds = np.stack([p[0] for p in prepared])
+        prompt_len = input_embeds.shape[1]
+        position_ids = np.tile(np.arange(prompt_len, dtype=np.int64), (B, 1))
 
         t_prefill_start = time.perf_counter()
         assert self.dec_request, "Model not loaded"
@@ -367,45 +423,92 @@ class OVQwen3ASR:
         logits = self.dec_request.get_output_tensor(0).data
         t_prefill = time.perf_counter() - t_prefill_start
 
-        token = int(np.argmax(logits[0, 0]))
-        generated = [token]
+        tokens = np.argmax(logits[:, -1], axis=-1).astype(np.int64)
+        generated = [[int(t)] for t in tokens]
+        done = np.array([int(t) in EOS_TOKEN_IDS for t in tokens])
 
         t_decode_start = time.perf_counter()
         for step in range(max_tokens - 1):
-            if token in EOS_TOKEN_IDS:
+            if done.all():
                 break
-            pos = prompt_len + step
-            embed = self._embed_tokens([token]).astype(np.float32)
-            pos_id = np.array([[pos]], dtype=np.int64)
+            feed = np.where(done, TOKEN_ENDOFTEXT, tokens)        # finished rows ride along; their output is dropped
+            embed = self._embed_tokens(feed[np.newaxis, :]).astype(np.float32).reshape(B, 1, -1)
+            pos_id = np.full((B, 1), prompt_len + step, dtype=np.int64)
 
             self.dec_request.set_input_tensor(0, ov.Tensor(embed))
             self.dec_request.set_input_tensor(1, ov.Tensor(pos_id))
             self.dec_request.infer()
             logits = self.dec_request.get_output_tensor(0).data
 
-            token = int(np.argmax(logits[0, 0]))
-            generated.append(token)
+            tokens = np.argmax(logits[:, -1], axis=-1).astype(np.int64)
+            for i in range(B):
+                if not done[i]:
+                    generated[i].append(int(tokens[i]))
+                    done[i] = int(tokens[i]) in EOS_TOKEN_IDS
         t_decode = time.perf_counter() - t_decode_start
 
-        while generated and generated[-1] in EOS_TOKEN_IDS:
-            generated.pop()
-
-        t_detok_start = time.perf_counter()
         assert self._tok_id_to_token and self._tok_special and self._tok_byte_dec, "Tokenizer state not loaded"
-        raw = Qwen3ASRHelpers.decode_tokens_cached(generated, self._tok_id_to_token, self._tok_special, self._tok_byte_dec)
-        t_detok = time.perf_counter() - t_detok_start
+        out = []
+        for (embeds, pm), gen in zip(prepared, generated):
+            while gen and gen[-1] in EOS_TOKEN_IDS:
+                gen.pop()
+            t_detok_start = time.perf_counter()
+            raw = Qwen3ASRHelpers.decode_tokens_cached(gen, self._tok_id_to_token, self._tok_special, self._tok_byte_dec)
+            metrics = self.collect_metrics(
+                feature_sec=pm["feature_sec"],
+                encoder_sec=pm["encoder_sec"],
+                prefill_sec=t_prefill / B,
+                decode_sec=t_decode / B,
+                detok_sec=time.perf_counter() - t_detok_start,
+                prompt_tokens=prompt_len,
+                generated_tokens=len(gen),
+                encoder_tokens=pm["encoder_tokens"],
+            )
+            metrics["batch_size"] = B
+            out.append((raw, metrics))
+        return out
 
-        metrics = self.collect_metrics(
-            feature_sec=t_feature,
-            encoder_sec=t_encoder,
-            prefill_sec=t_prefill,
-            decode_sec=t_decode,
-            detok_sec=t_detok,
-            prompt_tokens=prompt_len,
-            generated_tokens=len(generated),
-            encoder_tokens=expected_tokens,
-        )
-        return raw, metrics
+    def audio_chunks(self, chunk_audio: np.ndarray, max_tokens: int, language: Optional[str] = None):
+        return self.decode_batch([chunk_audio], max_tokens, language)[0]
+
+    async def _infer_chunk(self, chunk_audio: np.ndarray, max_tokens: int, language: Optional[str]):
+        """One chunk's (raw text, metrics), decoded together with any other chunks waiting meanwhile."""
+        fut = asyncio.get_running_loop().create_future()
+        self._pending.append((chunk_audio, max_tokens, language, fut))
+        if self._runner is None or self._runner.done():
+            self._runner = asyncio.create_task(self._run_pending())
+        return await fut
+
+    def _batches(self, items: list) -> list[list]:
+        """Waiting chunks grouped: one language prompt per batch, up to max_batch, similar lengths."""
+        items = sorted(items, key=lambda x: (x[2] or "", len(x[0])))
+        groups: list[list] = []
+        for it in items:
+            g = groups[-1] if groups else None
+            if (g and len(g) < self.max_batch and g[0][2] == it[2]
+                    and len(it[0]) - len(g[0][0]) <= SAMPLE_RATE * max(BATCH_PAD_SEC, BATCH_PAD_SHARE * len(it[0]) / SAMPLE_RATE)):
+                g.append(it)
+            else:
+                groups.append([it])
+        return groups
+
+    async def _run_pending(self) -> None:
+        while self._pending:
+            await asyncio.sleep(0)                  # let requests decoding their audio right now join in
+            items, self._pending = self._pending, []
+            for group in self._batches(items):
+                futs = [it[3] for it in group]
+                try:
+                    results = await asyncio.to_thread(self.decode_batch, [it[0] for it in group],
+                                                      max(it[1] for it in group), group[0][2])
+                except Exception as e:  # noqa: BLE001 - every request of the batch gets the error
+                    for f in futs:
+                        if not f.done():
+                            f.set_exception(e)
+                    continue
+                for f, r in zip(futs, results):
+                    if not f.done():
+                        f.set_result(r)
 
     async def transcribe(self, gen_config: OV_Qwen3ASRGenConfig) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
         t_transcribe_start = time.perf_counter()
@@ -447,15 +550,10 @@ class OVQwen3ASR:
             "generated_tokens": 0,
             "encoder_tokens": 0,
         }
-        for idx, (chunk_wav, chunk_offset_sec) in enumerate(chunk_items):
+        heard = await asyncio.gather(*(self._infer_chunk(chunk_wav, gen_config.max_tokens, language)
+                                       for chunk_wav, _ in chunk_items))      # a long file's chunks batch together
+        for idx, ((chunk_wav, chunk_offset_sec), (raw, chunk_metrics)) in enumerate(zip(chunk_items, heard)):
             chunk_sec = len(chunk_wav) / SAMPLE_RATE
-            logger.info(
-                f"[{self.load_config.model_name}] Chunk {idx + 1}/{len(chunk_items)} "
-                f"offset={chunk_offset_sec:.2f}s duration={chunk_sec:.2f}s"
-            )
-            raw, chunk_metrics = await asyncio.to_thread(
-                self.audio_chunks, chunk_wav, gen_config.max_tokens, language
-            )
             lang, text = parse_asr_output(raw, language=language)
             langs.append(lang)
             if text:
@@ -491,6 +589,7 @@ class OVQwen3ASR:
             encoder_tokens=agg["encoder_tokens"],
         )
         metrics["audio_duration_sec"] = audio_seconds
+        metrics["batch_size"] = max((m.get("batch_size", 1) for _, m in heard), default=1)
         metrics["model_load_sec"] = self.t_model_load
         metrics["end_to_end_sec"] = t_total
         metrics["rtf"] = end_to_end_rtf

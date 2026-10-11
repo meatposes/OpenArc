@@ -522,22 +522,29 @@ class QueueWorker:
     async def queue_worker_qwen3_asr(model_name: str, model_queue: asyncio.Queue, asr_model: OVQwen3ASR, registry: ModelRegistry):
         """Qwen3 ASR model inference worker that processes packets from queue."""
         logger.info(f"[Qwen3ASR Worker: {model_name}] Started, waiting for packets...")
-        while True:
+        # Several requests run at once so their chunks can be decoded together (OVQwen3ASR batches
+        # whatever is waiting); with a decoder that can't batch this is one at a time, as before.
+        slots = asyncio.Semaphore(2 * max(1, getattr(asr_model, "max_batch", 1)))
+        stop = asyncio.Event()
+
+        async def handle(packet: WorkerPacket) -> None:
+            try:
+                completed_packet = await InferWorker.infer_qwen3_asr(packet, asr_model)
+                if completed_packet.metrics:
+                    logger.info(f"[Qwen3ASR Worker: {model_name}] Metrics: {completed_packet.metrics}")
+                if _commit_completed_packet(packet, completed_packet, model_name, registry):
+                    stop.set()
+            finally:
+                slots.release()
+                model_queue.task_done()
+
+        while not stop.is_set():
             packet = await model_queue.get()
             if packet is None:
                 logger.info(f"[Qwen3ASR Worker: {model_name}] Shutdown signal received.")
                 break
-
-            completed_packet = await InferWorker.infer_qwen3_asr(packet, asr_model)
-
-            if completed_packet.metrics:
-                logger.info(f"[Qwen3ASR Worker: {model_name}] Metrics: {completed_packet.metrics}")
-
-            if _commit_completed_packet(packet, completed_packet, model_name, registry):
-                model_queue.task_done()
-                break
-
-            model_queue.task_done()
+            await slots.acquire()
+            asyncio.create_task(handle(packet))
 
     @staticmethod
     async def queue_worker_kokoro(model_name: str, model_queue: asyncio.Queue, kokoro_model: OV_Kokoro, registry: ModelRegistry):
